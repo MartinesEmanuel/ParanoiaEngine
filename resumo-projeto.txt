@@ -1,0 +1,108 @@
+## Paranoia Engine - Resumo do Projeto
+
+### Visão Geral
+Motor de análise estática + execução de cenários de caos para código-fonte Java. Escaneia diretórios com JavaParser, identifica fragilidades (transações sem lock, concorrência), gera cenários de caos via IA (LLM), e executa contra um sistema alvo (Finance Control) injetando falhas via Toxiproxy.
+
+### Estrutura do Monorepo
+```
+evo_fed/
+├── paranoia-engine/          # Motor de caos (Spring Boot 3.2.5, Java 21)
+│   ├── pom.xml
+│   └── src/
+│       ├── main/java/com/paranoia/engine/
+│       │   ├── ParanoiaEngineApplication.java
+│       │   ├── config/       # AsyncConfig, RestPipelineConfig, ToxiproxyConfig
+│       │   ├── controller/   # AnaliseController, ExecutarTudoController, RelatorioController, etc
+│       │   ├── execution/    # CenarioExecutor, ToxiproxyManager(Impl), AlvoOperacao, VerificadorEstado
+│       │   ├── model/        # Entidades JPA (AnaliseEntity, FragilidadeEntity, CenarioEntity, ResultadoExecucaoEntity), enums, records
+│       │   ├── repository/   # JPA repositories
+│       │   └── service/      # OrquestradorService, JavaParserAnaliseService, CenarioIaService, AnaliseService
+│       └── test/java/com/paranoia/engine/
+│           ├── controller/   # AnaliseControllerTest (2)
+│           ├── execution/    # CenarioExecutorIntegracaoTest (2), CenarioExecutorCompletoIntegracaoTest (3), ToxiproxyManagerImpl (test helper)
+│           └── service/      # CenarioIaServiceTest (3), JavaParserAnaliseServiceTest (8), OrquestradorServiceTest (3)
+├── finance-control/          # Alvo de teste (Spring Boot 3.2.5 autônomo, REST em localhost:9000)
+├── docker-compose.yml        # PostgreSQL x2 + Toxiproxy + init container
+└── AGENTS.md                 # Notas de contexto entre sessões
+```
+
+### Modelo de Dados
+- **`AnaliseEntity`** → `@OneToMany` FragilidadeEntity, status `StatusAnalise` (EM_ANDAMENTO/CONCLUIDA/FALHOU), contadores de progresso
+- **`FragilidadeEntity`** → `@ManyToOne` AnaliseEntity (nullable), pontos de fragilidade (arquivo, linha, tipo TRANSACAO/CONCORRENCIA)
+- **`CenarioEntity`** → vincula a Fragilidade, tipo `TipoCenario` (CONCORRENCIA/FALHA_REDE/FALHA_BANCO/TIMEOUT), severidade, descrição
+- **`ResultadoExecucaoEntity`** → resultado da execução, status `StatusExecucao` (SOBREVIVEU/QUEBROU/INCONCLUSIVO), logs
+
+### Pipeline Completo (OrquestradorService)
+```
+POST /api/analise  ->  cria AnaliseEntity, retorna 202 Accepted
+         |
+Analise estatica (JavaParser)  ->  identifica fragilidades -> salva FragilidadeEntity
+         |
+Geracao de cenarios (CenarioIaService)  ->  IA cria cenarios de caos
+         |
+Execucao (CenarioExecutor)  ->  aplica toxic, executa operacao, verifica estado
+         |
+GET /api/executar-tudo/{analiseId}/status  ->  progresso
+GET /api/relatorio/{analiseId}  ->  resultados consolidados
+```
+
+Pipeline é `@Async("pipelineExecutor")` com `ThreadPoolTaskExecutor` (core=2, max=4). Falhas parciais não abortam: fragilidades com erro são puladas.
+
+### Execução de Cenários de Caos (CenarioExecutor)
+- **`executarConcorrencia`** — múltiplas threads concorrentes (configurável)
+- **`executarComFalha`** — com Toxiproxy:
+  1. Aplica toxic (desabilita proxy para FALHA_REDE/BANCO, latency 30s para TIMEOUT)
+  2. Executa operação alvo em thread separada (awaitTermination 10s)
+  3. Restaura proxy e limpa toxics
+  4. Salva resultado (com fallback em memória se conexão foi cortada pelo toxic)
+
+### Provedores REST (RestPipelineConfig)
+Chamam Finance Control via HTTP (`localhost:9000`) sem dependência JAR direta:
+- **Login JWT**: `POST /api/auth/login` -> admin/admin123
+- **AlvoOperacao REST**: cria transação INCOME/EXPENSE
+- **VerificadorEstado REST**: GET `/api/actuator/health`
+- Token JWT obtido a cada operação (sem cache)
+
+### Toxiproxy Integration
+- **`ToxiproxyManagerImpl`**: implementa `ToxiproxyManager` interface
+  - Conecta via `ToxiproxyClient` (porta 8474)
+  - `obterProxy(nome)`: busca ou auto-cria proxy (`0.0.0.0:5433` -> `postgres:5432`)
+  - `aplicarFalha(tipo, proxyNome)`: disable proxy ou latency 30s
+  - `restaurar(proxyNome)`: enable + reset (limpa toxics)
+- **`ToxiproxyConfig`**: cria bean condicional via `@ConditionalOnProperty("toxiproxy.url")` (default `localhost:8474`)
+- **Docker Compose**: PostgreSQL (x2, portas 5432 e 5434) + Toxiproxy (8474) + init container via `ghcr.io/shopify/toxiproxy:2.8.0`
+
+### Testes
+- **Unitários (16)**: `mvn test`
+  - AnaliseControllerTest (2)
+  - OrquestradorServiceTest (3)
+  - JavaParserAnaliseServiceTest (8)
+  - CenarioIaServiceTest (3)
+- **Integração (5)**: `mvn test -P integracao`
+  - CenarioExecutorIntegracaoTest (2): concorrência com PostgreSQL via TestContainers
+  - CenarioExecutorCompletoIntegracaoTest (3): caos com Toxiproxy + PostgreSQL via TestContainers, com `softEvictConnections()` para limpar pool quebrado entre testes
+
+### Configurações Importantes
+- `pom.xml`: surefire com `<excludedGroups>` + perfil `integracao` que sobrescreve
+- `<systemPropertyVariables>`: `docker.host=unix:///var/run/docker.sock`, `api.version=1.40`
+- `spring.jpa.open-in-view: false`
+- `spring.datasource.hikari.connection-test-query=SELECT 1`
+- `spring.datasource.hikari.max-lifetime=5000`
+
+### Docker Compose
+```yaml
+services:
+  postgres:          # :5432, usado pela paranoia-engine
+  finance-postgres:  # :5434, usado pelo finance-control
+  toxiproxy:         # :8474, controle de proxies
+  init:              # cria proxies postgres (:5433) e finance-db (:5435)
+```
+
+### Finance Control
+- Spring Boot 3.2.5 autônomo (`evo_fed/finance-control/`)
+- Iniciar com: `--spring.profiles.active=toxiproxy` (conecta via proxy `localhost:5435`)
+- Não há dependência JAR entre paranoia-engine e finance-control (comunicação REST pura)
+
+### Resultado Final
+- **21/21 testes passando** (16 unit + 5 integração)
+- `BUILD SUCCESS` confirmado

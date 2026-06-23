@@ -1,0 +1,27 @@
+target/
+*.class
+*.jar
+*.log
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+bin/
+build/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Finance Control - frontend
+node_modules/
+dist/
+.next/
+
+# Finance Control - backend
+finance-control/target/
+finance-control/Finance-Control/node_modules/
+finance-control/Finance-Control/dist/
